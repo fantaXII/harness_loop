@@ -1,0 +1,9 @@
+
+#opencode, claudecode
+.omo/
+.omc/
+.claude/
+
+#etc
+test/
+temp/
