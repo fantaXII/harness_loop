@@ -1,0 +1,9 @@
+{
+  "name": "loop-skill",
+  "version": "0.1.0",
+  "description": "Generic self-referential loop (ralph-loop pattern) with a pipeline extension point. Domain-agnostic core — pipelines plug in via pipelines/<name>/prompt.md.",
+  "author": {
+    "name": "loop-skill contributors",
+    "email": ""
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "description": "Loop Skill stop hook — generic self-referential loop, no domain logic",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/stop-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
