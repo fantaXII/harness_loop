@@ -1,6 +1,6 @@
 ---
 description: "Start a generic self-referential loop (optionally driven by a --pipeline definition)"
-argument-hint: "[PROMPT...] | --pipeline <name> [--max-iterations N] [--completion-promise TEXT] [--state-dir PATH]"
+argument-hint: "[PROMPT...] | --pipeline <name> [--max-iterations N] [--state-dir PATH]"
 allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup-loop-skill.sh:*)"]
 hide-from-slash-command-tool: "true"
 ---
@@ -19,6 +19,9 @@ SAME prompt back to you for the next iteration. You'll see your previous work in
 and git history — this is how continuity works without the loop core knowing anything
 about what you're doing.
 
-CRITICAL RULE: If a completion promise is set, you may ONLY output it when the statement
-is completely and unequivocally TRUE. Do not output false promises to escape the loop,
-even if you think you're stuck. The loop is designed to continue until genuine completion.
+CRITICAL RULE: The loop only stops when you write `{"status": "complete"}` to
+`<state_dir>/status.json` using the Write tool, or when max-iterations is reached. Only
+write `complete` when the task is genuinely, completely done — do not write it prematurely
+to escape the loop, even if you think you're stuck. If the task truly cannot be completed,
+write `{"status": "failed", "reason": "<short honest reason>"}` instead — that also ends
+the loop, but is reported differently so it isn't confused with genuine success.

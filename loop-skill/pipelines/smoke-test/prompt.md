@@ -5,5 +5,7 @@ This is a minimal example pipeline for `loop-skill`, used to verify that
 loop's fixed prompt body.
 
 Task: write a one-line file named `smoke-test-output.txt` under the reported
-`state_dir` containing the current iteration number, then check whether the
-task is done according to the completion promise given on the command line.
+`state_dir` containing the current iteration number. Once
+`smoke-test-output.txt` already exists (i.e. on the iteration after you first
+created it), write `{"status": "complete"}` to `<state_dir>/status.json`
+using the Write tool to end the loop.

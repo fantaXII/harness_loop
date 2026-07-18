@@ -1,7 +1,9 @@
 #!/bin/bash
 # Loop Skill Stop Hook
 # Prevents session exit while a loop is active; feeds the SAME prompt back.
-# Domain-agnostic: never reads or writes anything inside state_dir.
+# Domain-agnostic except for one fixed contract file: <state_dir>/status.json
+# (§3.6.1). This hook only READS that file to decide completion — it never
+# writes it, and it never reads or writes anything else inside state_dir.
 
 set -euo pipefail
 
@@ -16,7 +18,7 @@ fi
 FRONTMATTER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$STATE_FILE")
 ITERATION=$(echo "$FRONTMATTER" | grep '^iteration:' | sed 's/iteration: *//')
 MAX_ITERATIONS=$(echo "$FRONTMATTER" | grep '^max_iterations:' | sed 's/max_iterations: *//')
-COMPLETION_PROMISE=$(echo "$FRONTMATTER" | grep '^completion_promise:' | sed 's/completion_promise: *//' | sed 's/^"\(.*\)"$/\1/')
+STATE_DIR=$(echo "$FRONTMATTER" | grep '^state_dir:' | sed 's/state_dir: *//' | sed 's/^"\(.*\)"$/\1/')
 
 # Session isolation — a state file belongs to exactly one session.
 STATE_SESSION=$(echo "$FRONTMATTER" | grep '^session_id:' | sed 's/session_id: *//' || true)
@@ -42,45 +44,28 @@ if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
   exit 0
 fi
 
-TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path')
-if [[ ! -f "$TRANSCRIPT_PATH" ]]; then
-  echo "⚠️  Loop skill: transcript file not found. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-if ! grep -q '"role":"assistant"' "$TRANSCRIPT_PATH"; then
-  echo "⚠️  Loop skill: no assistant messages found in transcript. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-LAST_LINES=$(grep '"role":"assistant"' "$TRANSCRIPT_PATH" | tail -n 100)
-if [[ -z "$LAST_LINES" ]]; then
-  echo "⚠️  Loop skill: failed to extract assistant messages. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-set +e
-LAST_OUTPUT=$(echo "$LAST_LINES" | jq -rs '
-  map(.message.content[]? | select(.type == "text") | .text) | last // ""
-' 2>&1)
-JQ_EXIT=$?
-set -e
-
-if [[ $JQ_EXIT -ne 0 ]]; then
-  echo "⚠️  Loop skill: failed to parse transcript JSON. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
-  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
-    echo "✅ Loop skill: detected <promise>$COMPLETION_PROMISE</promise>"
-    rm "$STATE_FILE"
-    exit 0
+# §3.6.1 completion signal — the ONLY file inside state_dir the core ever
+# reads. Missing file, or a missing/unrecognized 'status' field, is treated
+# as not-yet-complete (graceful degradation, same principle as the original
+# ralph-loop's jq-failure tolerance).
+if [[ -n "$STATE_DIR" ]]; then
+  STATUS_FILE="${STATE_DIR}/status.json"
+  if [[ -f "$STATUS_FILE" ]]; then
+    set +e
+    STATUS=$(jq -r '.status // empty' "$STATUS_FILE" 2>/dev/null)
+    set -e
+    if [[ "$STATUS" == "complete" ]]; then
+      echo "✅ Loop skill: pipeline reported completion (${STATUS_FILE})"
+      rm "$STATE_FILE"
+      exit 0
+    elif [[ "$STATUS" == "failed" ]]; then
+      set +e
+      REASON=$(jq -r '.reason // "no reason given"' "$STATUS_FILE" 2>/dev/null)
+      set -e
+      echo "🛑 Loop skill: pipeline reported failure (${STATUS_FILE}): ${REASON:-no reason given}"
+      rm "$STATE_FILE"
+      exit 0
+    fi
   fi
 fi
 
@@ -101,11 +86,7 @@ TEMP_FILE="${STATE_FILE}.tmp.$$"
 sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$STATE_FILE" > "$TEMP_FILE"
 mv "$TEMP_FILE" "$STATE_FILE"
 
-if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  SYSTEM_MSG="🔄 Loop iteration $NEXT_ITERATION | To stop: output <promise>$COMPLETION_PROMISE</promise> (ONLY when TRUE)"
-else
-  SYSTEM_MSG="🔄 Loop iteration $NEXT_ITERATION | No completion promise set — runs until max-iterations"
-fi
+SYSTEM_MSG="🔄 Loop iteration $NEXT_ITERATION | To stop: write {\"status\":\"complete\"} to ${STATE_DIR}/status.json"
 
 jq -n \
   --arg prompt "$PROMPT_TEXT" \

@@ -59,7 +59,7 @@ loop-skill/
 ```markdown
 ---
 description: "Start a generic self-referential loop (optionally driven by a --pipeline definition)"
-argument-hint: "[PROMPT...] | --pipeline <name> [--max-iterations N] [--completion-promise TEXT] [--state-dir PATH]"
+argument-hint: "[PROMPT...] | --pipeline <name> [--max-iterations N] [--state-dir PATH]"
 allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup-loop-skill.sh:*)"]
 hide-from-slash-command-tool: "true"
 ---
@@ -78,9 +78,12 @@ SAME prompt back to you for the next iteration. You'll see your previous work in
 and git history — this is how continuity works without the loop core knowing anything
 about what you're doing.
 
-CRITICAL RULE: If a completion promise is set, you may ONLY output it when the statement
-is completely and unequivocally TRUE. Do not output false promises to escape the loop,
-even if you think you're stuck. The loop is designed to continue until genuine completion.
+CRITICAL RULE: The loop only stops when you write `{"status": "complete"}` to
+`<state_dir>/status.json` using the Write tool, or when max-iterations is reached. Only
+write `complete` when the task is genuinely, completely done — do not write it prematurely
+to escape the loop, even if you think you're stuck. If the task truly cannot be completed,
+write `{"status": "failed", "reason": "<short honest reason>"}` instead — that also ends
+the loop, but is reported differently so it isn't confused with genuine success.
 ```
 
 **설치 시점 치환**: `${CLAUDE_PLUGIN_ROOT}`는 plugin 컨텍스트가 없으므로 installer가 payload 절대경로(`~/.claude/skills/loop-skill`)로 치환한 뒤 `~/.claude/commands/loop-skill.md`에 설치한다(§5.1 `register_hooks_and_commands()`).
@@ -115,18 +118,21 @@ fi
 # Creates the state file + state_dir for an in-session self-referential loop.
 # This script is domain-agnostic: it never inspects or assumes the structure
 # of anything inside state_dir, and it does not care what --pipeline's
-# prompt.md contains.
+# prompt.md contains. The only "config" it reads besides CLI args is
+# .claude/loop-skill.config, and only for two known keys (§3.7).
 
 set -euo pipefail
 
 STATE_FILE=".claude/loop-skill.local.md"
+CONFIG_FILE=".claude/loop-skill.config"
 DEFAULT_MAX_ITERATIONS=50
 
 PROMPT_PARTS=()
-MAX_ITERATIONS=$DEFAULT_MAX_ITERATIONS
-COMPLETION_PROMISE="null"
+MAX_ITERATIONS=""
 PIPELINE_NAME=""
 STATE_DIR_OVERRIDE=""
+CLI_MAX_ITERATIONS_SET=false
+CLI_PIPELINE_SET=false
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -139,14 +145,21 @@ USAGE:
   /loop-skill --pipeline <name> [OPTIONS]
 
 OPTIONS:
-  --max-iterations <n>           Maximum iterations before auto-stop (default: 50, 0 = unlimited)
-  --completion-promise '<text>'  Promise phrase (USE QUOTES for multi-word)
-  --pipeline <name>               Load pipelines/<name>/prompt.md as the loop body
-  --state-dir <path>               Override the default state_dir location
-  -h, --help                      Show this help message
+  --max-iterations <n>   Maximum iterations before auto-stop (default: 50, 0 = unlimited)
+  --pipeline <name>       Load pipelines/<name>/prompt.md as the loop body
+                          (value = folder name under pipelines/, e.g. "l1-log-analysis")
+  --state-dir <path>       Override the default state_dir location
+  -h, --help              Show this help message
+
+DEFAULTS FILE (optional, §3.7):
+  .claude/loop-skill.config (dotenv format) can set LOOP_SKILL_PIPELINE and/or
+  LOOP_SKILL_MAX_ITERATIONS as project-level defaults. Precedence:
+  CLI args > .claude/loop-skill.config > built-in default (max-iterations=50).
 
 STOPPING:
-  Only by reaching --max-iterations or detecting --completion-promise.
+  The loop stops when --max-iterations is reached, OR when the pipeline writes
+  {"status": "complete"} (or {"status": "failed", "reason": "..."}) to
+  <state_dir>/status.json (§3.6.1).
 HELP_EOF
       exit 0
       ;;
@@ -155,19 +168,13 @@ HELP_EOF
         echo "❌ Error: --max-iterations must be a non-negative integer, got: ${2:-<missing>}" >&2
         exit 1
       fi
-      MAX_ITERATIONS="$2"; shift 2 ;;
-    --completion-promise)
-      if [[ -z "${2:-}" ]]; then
-        echo "❌ Error: --completion-promise requires a text argument" >&2
-        exit 1
-      fi
-      COMPLETION_PROMISE="$2"; shift 2 ;;
+      MAX_ITERATIONS="$2"; CLI_MAX_ITERATIONS_SET=true; shift 2 ;;
     --pipeline)
       if [[ -z "${2:-}" ]]; then
         echo "❌ Error: --pipeline requires a name argument" >&2
         exit 1
       fi
-      PIPELINE_NAME="$2"; shift 2 ;;
+      PIPELINE_NAME="$2"; CLI_PIPELINE_SET=true; shift 2 ;;
     --state-dir)
       if [[ -z "${2:-}" ]]; then
         echo "❌ Error: --state-dir requires a path argument" >&2
@@ -179,17 +186,38 @@ HELP_EOF
   esac
 done
 
+# §3.7 config defaults — CLI args always win; the config file is consulted
+# only for values the CLI did not set. The core knows exactly these two keys
+# and nothing else about the file's contents.
+if [[ -f "$CONFIG_FILE" ]]; then
+  CONFIG_PIPELINE=$(grep -E '^LOOP_SKILL_PIPELINE=' "$CONFIG_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2- || true)
+  CONFIG_MAX_ITERATIONS=$(grep -E '^LOOP_SKILL_MAX_ITERATIONS=' "$CONFIG_FILE" 2>/dev/null | tail -n1 | cut -d'=' -f2- || true)
+
+  if [[ "$CLI_PIPELINE_SET" == "false" ]] && [[ -n "${CONFIG_PIPELINE:-}" ]]; then
+    PIPELINE_NAME="$CONFIG_PIPELINE"
+  fi
+  if [[ "$CLI_MAX_ITERATIONS_SET" == "false" ]] && [[ -n "${CONFIG_MAX_ITERATIONS:-}" ]]; then
+    if [[ "$CONFIG_MAX_ITERATIONS" =~ ^[0-9]+$ ]]; then
+      MAX_ITERATIONS="$CONFIG_MAX_ITERATIONS"
+    else
+      echo "⚠️  Loop skill: ignoring invalid LOOP_SKILL_MAX_ITERATIONS in $CONFIG_FILE (not a non-negative integer): $CONFIG_MAX_ITERATIONS" >&2
+    fi
+  fi
+fi
+
+MAX_ITERATIONS="${MAX_ITERATIONS:-$DEFAULT_MAX_ITERATIONS}"
+
 # [CR-4] Active loop guard — never silently clobber an in-flight loop.
 if [[ -f "$STATE_FILE" ]]; then
   CURRENT_ITER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$STATE_FILE" | grep '^iteration:' | sed 's/iteration: *//')
   echo "❌ Error: 이미 활성 loop가 있습니다 (iteration ${CURRENT_ITER:-?})" >&2
-  echo "   중지하려면 /cancel-loop-skill을 실행하거나 completion promise/max-iterations 도달을 기다리세요." >&2
+  echo "   중지하려면 /cancel-loop-skill을 실행하거나 status.json 완료 신호/max-iterations 도달을 기다리세요." >&2
   exit 1
 fi
 
 # Resolve the prompt body: --pipeline takes precedence over inline PROMPT.
 # The core does NOT interpret pipeline prompt.md content — it is read and
-# copied verbatim.
+# copied verbatim. PIPELINE_NAME must match a folder name under pipelines/.
 if [[ -n "$PIPELINE_NAME" ]]; then
   PIPELINE_PROMPT_FILE="${CLAUDE_PLUGIN_ROOT:-.}/pipelines/${PIPELINE_NAME}/prompt.md"
   if [[ ! -f "$PIPELINE_PROMPT_FILE" ]]; then
@@ -203,23 +231,18 @@ else
     echo "❌ Error: No prompt provided and no --pipeline given" >&2
     echo "   Examples:" >&2
     echo "     /loop-skill Build a REST API for todos" >&2
-    echo "     /loop-skill --pipeline l1-log-analysis --completion-promise 'DONE'" >&2
+    echo "     /loop-skill --pipeline l1-log-analysis" >&2
     exit 1
   fi
 fi
 
-# Resolve state_dir — a bare empty directory the core will never touch again.
+# Resolve state_dir — a bare empty directory the core will never touch again,
+# except to read <state_dir>/status.json for the completion signal (§3.6.1).
 RUN_ID="loop-$(date -u +%Y%m%d-%H%M%S)"
 STATE_DIR="${STATE_DIR_OVERRIDE:-.claude/loop-skill/${RUN_ID}}"
 mkdir -p "$STATE_DIR"
 
 mkdir -p .claude
-
-if [[ -n "$COMPLETION_PROMISE" ]] && [[ "$COMPLETION_PROMISE" != "null" ]]; then
-  COMPLETION_PROMISE_YAML="\"$COMPLETION_PROMISE\""
-else
-  COMPLETION_PROMISE_YAML="null"
-fi
 
 if [[ -n "$PIPELINE_NAME" ]]; then
   PIPELINE_YAML="\"$PIPELINE_NAME\""
@@ -233,7 +256,6 @@ active: true
 iteration: 1
 session_id: ${CLAUDE_CODE_SESSION_ID:-}
 max_iterations: $MAX_ITERATIONS
-completion_promise: $COMPLETION_PROMISE_YAML
 started_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 state_dir: "$STATE_DIR"
 pipeline: $PIPELINE_YAML
@@ -249,7 +271,6 @@ Iteration: 1
 Max iterations: $(if [[ $MAX_ITERATIONS -gt 0 ]]; then echo $MAX_ITERATIONS; else echo "unlimited"; fi)
 Pipeline: $(if [[ -n "$PIPELINE_NAME" ]]; then echo "$PIPELINE_NAME"; else echo "none (plain prompt)"; fi)
 State dir: $STATE_DIR
-Completion promise: $(if [[ "$COMPLETION_PROMISE" != "null" ]]; then echo "${COMPLETION_PROMISE//\"/} (ONLY output when TRUE!)"; else echo "none (runs until max-iterations)"; fi)
 
 The Stop hook is now active. To cancel: /cancel-loop-skill
 EOF
@@ -259,11 +280,12 @@ if [[ -n "$PROMPT" ]]; then
   echo "$PROMPT"
 fi
 
-if [[ "$COMPLETION_PROMISE" != "null" ]]; then
-  echo ""
-  echo "To complete this loop, output this EXACT text: <promise>$COMPLETION_PROMISE</promise>"
-  echo "Only output it when the statement is completely and unequivocally TRUE."
-fi
+echo ""
+echo "To end this loop, write EXACTLY this JSON to ${STATE_DIR}/status.json using the Write tool:"
+echo '  {"status": "complete"}'
+echo "If the task genuinely cannot be completed, write instead:"
+echo '  {"status": "failed", "reason": "<short reason>"}'
+echo "Only write this when the condition is truly met — do not write it prematurely to escape the loop."
 ```
 
 **원본 ralph-loop 대비 변경점 요약** (계획 §3.5 원칙 준수 여부 확인용):
@@ -274,6 +296,7 @@ fi
 | `--pipeline`, `--state-dir` 옵션 추가 | 계획 §3.6 확장 계약 구현 |
 | `state_dir` 생성(빈 디렉토리) | 계획 §3.6 항목 2 |
 | state 파일에 `state_dir`, `pipeline` 필드 추가 | 계획 §6.1 |
+| `--completion-promise` 옵션·`completion_promise` 필드 제거, `.claude/loop-skill.config`(§3.7) 파싱 추가 | 3차 개정 — §3.6.1 완료 신호를 파일 기반으로 이전 |
 | **그 외 로직 전부 원본과 동일** | 계획 §3.5 "코어는 도메인 로직을 모른다" 원칙 |
 
 ## 6. `hooks/hooks.json`
@@ -300,13 +323,15 @@ fi
 
 ## 7. `hooks/stop-hook.sh`
 
-원본 ralph-loop의 `stop-hook.sh`를 **의도적으로 최소 변경**만 가한 버전이다. 변경점은 상태 파일 경로 하나뿐이며, `state_dir` 내부를 읽거나 쓰는 코드는 어디에도 없다(계획 §3.5 원칙 검증용으로 아래 diff 요약 참고).
+원본 ralph-loop의 `stop-hook.sh`에서 iteration/session/max-iterations 로직은 그대로 가져오되, 완료 판단부만 transcript `<promise>` 텍스트 파싱에서 `state_dir/status.json` 파일 확인으로 교체한 버전이다(계획 §3.6.1, §7.1). 이 교체 덕분에 `TRANSCRIPT_PATH` 조회, transcript grep/jq 파싱, `perl` 의존성이 전부 사라졌다. `state_dir` 안에서 이 스크립트가 손대는 파일은 `status.json` 하나(그것도 읽기만) 뿐이다(계획 §3.5/§6.2 원칙 검증용으로 아래 diff 요약 참고).
 
 ```bash
 #!/bin/bash
 # Loop Skill Stop Hook
 # Prevents session exit while a loop is active; feeds the SAME prompt back.
-# Domain-agnostic: never reads or writes anything inside state_dir.
+# Domain-agnostic except for one fixed contract file: <state_dir>/status.json
+# (§3.6.1). This hook only READS that file to decide completion — it never
+# writes it, and it never reads or writes anything else inside state_dir.
 
 set -euo pipefail
 
@@ -321,7 +346,7 @@ fi
 FRONTMATTER=$(sed -n '/^---$/,/^---$/{ /^---$/d; p; }' "$STATE_FILE")
 ITERATION=$(echo "$FRONTMATTER" | grep '^iteration:' | sed 's/iteration: *//')
 MAX_ITERATIONS=$(echo "$FRONTMATTER" | grep '^max_iterations:' | sed 's/max_iterations: *//')
-COMPLETION_PROMISE=$(echo "$FRONTMATTER" | grep '^completion_promise:' | sed 's/completion_promise: *//' | sed 's/^"\(.*\)"$/\1/')
+STATE_DIR=$(echo "$FRONTMATTER" | grep '^state_dir:' | sed 's/state_dir: *//' | sed 's/^"\(.*\)"$/\1/')
 
 # Session isolation — a state file belongs to exactly one session.
 STATE_SESSION=$(echo "$FRONTMATTER" | grep '^session_id:' | sed 's/session_id: *//' || true)
@@ -347,45 +372,28 @@ if [[ $MAX_ITERATIONS -gt 0 ]] && [[ $ITERATION -ge $MAX_ITERATIONS ]]; then
   exit 0
 fi
 
-TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path')
-if [[ ! -f "$TRANSCRIPT_PATH" ]]; then
-  echo "⚠️  Loop skill: transcript file not found. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-if ! grep -q '"role":"assistant"' "$TRANSCRIPT_PATH"; then
-  echo "⚠️  Loop skill: no assistant messages found in transcript. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-LAST_LINES=$(grep '"role":"assistant"' "$TRANSCRIPT_PATH" | tail -n 100)
-if [[ -z "$LAST_LINES" ]]; then
-  echo "⚠️  Loop skill: failed to extract assistant messages. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-set +e
-LAST_OUTPUT=$(echo "$LAST_LINES" | jq -rs '
-  map(.message.content[]? | select(.type == "text") | .text) | last // ""
-' 2>&1)
-JQ_EXIT=$?
-set -e
-
-if [[ $JQ_EXIT -ne 0 ]]; then
-  echo "⚠️  Loop skill: failed to parse transcript JSON. Stopping." >&2
-  rm "$STATE_FILE"
-  exit 0
-fi
-
-if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
-  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
-    echo "✅ Loop skill: detected <promise>$COMPLETION_PROMISE</promise>"
-    rm "$STATE_FILE"
-    exit 0
+# §3.6.1 completion signal — the ONLY file inside state_dir the core ever
+# reads. Missing file, or a missing/unrecognized 'status' field, is treated
+# as not-yet-complete (graceful degradation, same principle as the original
+# ralph-loop's jq-failure tolerance).
+if [[ -n "$STATE_DIR" ]]; then
+  STATUS_FILE="${STATE_DIR}/status.json"
+  if [[ -f "$STATUS_FILE" ]]; then
+    set +e
+    STATUS=$(jq -r '.status // empty' "$STATUS_FILE" 2>/dev/null)
+    set -e
+    if [[ "$STATUS" == "complete" ]]; then
+      echo "✅ Loop skill: pipeline reported completion (${STATUS_FILE})"
+      rm "$STATE_FILE"
+      exit 0
+    elif [[ "$STATUS" == "failed" ]]; then
+      set +e
+      REASON=$(jq -r '.reason // "no reason given"' "$STATUS_FILE" 2>/dev/null)
+      set -e
+      echo "🛑 Loop skill: pipeline reported failure (${STATUS_FILE}): ${REASON:-no reason given}"
+      rm "$STATE_FILE"
+      exit 0
+    fi
   fi
 fi
 
@@ -406,11 +414,7 @@ TEMP_FILE="${STATE_FILE}.tmp.$$"
 sed "s/^iteration: .*/iteration: $NEXT_ITERATION/" "$STATE_FILE" > "$TEMP_FILE"
 mv "$TEMP_FILE" "$STATE_FILE"
 
-if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
-  SYSTEM_MSG="🔄 Loop iteration $NEXT_ITERATION | To stop: output <promise>$COMPLETION_PROMISE</promise> (ONLY when TRUE)"
-else
-  SYSTEM_MSG="🔄 Loop iteration $NEXT_ITERATION | No completion promise set — runs until max-iterations"
-fi
+SYSTEM_MSG="🔄 Loop iteration $NEXT_ITERATION | To stop: write {\"status\":\"complete\"} to ${STATE_DIR}/status.json"
 
 jq -n \
   --arg prompt "$PROMPT_TEXT" \
@@ -424,7 +428,7 @@ jq -n \
 exit 0
 ```
 
-**원본 ralph-loop `stop-hook.sh` 대비 변경점**: 상태 파일 경로(`ralph-loop.local.md` → `loop-skill.local.md`)와 로그 메시지 문구(브랜딩)뿐이다. iteration 증가, session 검증, numeric validation, transcript 파싱, `<promise>` 비교, 원자적 쓰기(temp file + mv) 로직은 **바이트 단위로 동일**하다. `state_dir`/`pipeline` 필드는 frontmatter에 있어도 이 스크립트는 아예 읽지 않는다 — 계획 §3.5/§6.2의 "코어는 state_dir를 절대 읽거나 쓰지 않는다"는 원칙을 코드로 증명한다.
+**원본 ralph-loop `stop-hook.sh` 대비 변경점**: 상태 파일 경로(`ralph-loop.local.md` → `loop-skill.local.md`), 로그 메시지 문구(브랜딩), 그리고 완료 판단 메커니즘(transcript `<promise>` 파싱 → `state_dir/status.json` 파일 확인, §3.6.1)이다. iteration 증가, session 검증, numeric validation, 원자적 쓰기(temp file + mv) 로직은 원본과 동일하다. `state_dir` frontmatter 필드는 이제 이 스크립트가 **읽기는** 한다(§3.6.1 예외) — 다만 그 안에서 접근하는 파일은 `status.json` 하나뿐이고, 쓰기는 절대 하지 않는다. 계획 §3.5/§6.2의 "코어는 state_dir를 절대 읽거나 쓰지 않는다"는 원칙이 "`status.json` 하나는 읽되 쓰지는 않는다"로 정교화되었음을 코드로 증명한다.
 
 ## 8. `pipelines/README.md`
 
@@ -439,6 +443,10 @@ exit 0
   이 파일 안에서 상태를 어떻게 유지할지(단일 리포트 파일, 여러 subagent가 협업하는
   manifest.json 기반 파이프라인 등)는 전적으로 여러분이 설계합니다.
 
+- `prompt.md`는 반드시 "완료로 판단되면 `<state_dir>/status.json`에
+  `{"status": "complete"}`를 Write 툴로 기록하라"는 지시를 포함해야 합니다 — 그렇지 않으면
+  loop은 절대 스스로 끝나지 않고 `--max-iterations`까지 계속됩니다.
+
 ## 선택
 - `pipelines/<name>/agents/*.md` — Claude Code 커스텀 subagent 정의. 존재하면 설치 시
   `~/.claude/agents/`로 자동 복사됩니다. 파일 개수/이름/내용은 코어가 전혀 신경 쓰지 않습니다.
@@ -448,10 +456,12 @@ exit 0
 - `state_dir`(빈 디렉토리 하나)가 항상 준비되어 있습니다. 경로는 loop 시작 시 출력되고,
   state 파일의 `state_dir` frontmatter 필드에도 기록됩니다.
 - 매 iteration 동일한 `prompt.md` 내용이 그대로 재feed됩니다.
-- `<promise>텍스트</promise>`가 `--completion-promise`와 정확히 일치하면 loop이 종료됩니다.
+- `<state_dir>/status.json`에 `{"status": "complete"}` 또는
+  `{"status": "failed", "reason": "..."}`가 쓰이면 loop이 종료됩니다. 코어가 읽는(쓰지 않는)
+  state_dir 내부 파일은 이것 하나뿐입니다.
 
 ## 코어가 하지 않는 것 (여러분의 책임)
-- `state_dir` 내부에 무엇을 만들지 결정하지 않습니다.
+- `state_dir` 내부에 무엇을 만들지 결정하지 않습니다(`status.json` 제외).
 - 작업이 끝났는지 판단하지 않습니다 — `prompt.md`가 LLM에게 판단 기준을 제시해야 합니다.
 - 여러 agent를 어떤 순서로 부를지 orchestrate하지 않습니다 — 필요하다면 `prompt.md` 자체가
   orchestrator 역할을 하도록 작성하세요 (예시: `harness_loop_plan_v02.md` 부록 A 참고).
@@ -465,15 +475,27 @@ active: true
 iteration: 1
 session_id: ses_xxx
 max_iterations: 50
-completion_promise: "DONE"        # 또는 null
 started_at: "2026-07-19T10:00:00Z"
 state_dir: ".claude/loop-skill/loop-20260719-100000"
-pipeline: null                    # 또는 "<pipeline-name>"
+pipeline: null                    # 또는 "<pipeline-name>", CLI > .claude/loop-skill.config 순으로 결정(§3.7)
 ---
 
 [프롬프트 본문 — --pipeline 지정 시 pipelines/<name>/prompt.md 내용,
- 아니면 사용자가 직접 입력한 텍스트. 이후 iteration에서도 변경되지 않는다]
+ 아니면 사용자가 직접 입력한 텍스트. 이후 iteration에서도 변경되지 않는다.
+ 완료 시 <state_dir>/status.json을 쓰라는 지시가 본문(또는 커맨드 템플릿)에 포함된다 — §3.6.1]
 ```
+
+`completion_promise` 필드는 3차 개정으로 제거되었다 — 완료 판단은 `state_dir/status.json`(§3.6.1)로 이전되었다.
+
+## 9.1 `.claude/loop-skill.config` (선택, §3.7)
+
+```bash
+# dotenv 형식, 코어가 아는 키는 이 두 개뿐
+LOOP_SKILL_PIPELINE=l1-log-analysis
+LOOP_SKILL_MAX_ITERATIONS=50
+```
+
+`setup-loop-skill.sh`가 loop 시작 시점에만 읽는다. CLI 인자 > 이 파일 > 내장 기본값(`max_iterations=50`, `pipeline=null`) 순으로 결정되며, 파일이 없어도 에러 없이 내장 기본값을 쓴다.
 
 ## 10. Installer / Uninstaller
 
@@ -1055,13 +1077,21 @@ test ! -f install/install-state.json
 # Expected: 사용자가 나중에 추가한 hook은 그대로 남고, loop-skill이 등록한 것만 제거됨
 ```
 
-**Test 5: 완료 조건 텍스트 정확 매칭**
+**Test 5: 완료 신호 파일 확인 (§3.6.1)**
 ```bash
-/loop-skill "간단한 작업" --completion-promise "ALL DONE" --max-iterations 10
-# iteration 1: LLM이 "<promise>almost done</promise>" 같은 유사 문구 출력 (고의로 불일치)
+/loop-skill "간단한 작업" --max-iterations 10
+STATE_DIR=$(grep '^state_dir:' .claude/loop-skill.local.md | sed 's/state_dir: *"\(.*\)"/\1/')
+# iteration 1: status.json 없음
 # Expected: loop 계속됨 (state 파일 iteration 증가, active 유지)
-# iteration 2: LLM이 정확히 "<promise>ALL DONE</promise>" 출력
-# Expected: loop 즉시 종료, .claude/loop-skill.local.md 삭제됨
+echo '{"status": "failed", "reason": "아직 판단 중"}' > "$STATE_DIR/status.json"
+# 세션 종료 시도 트리거
+# Expected: loop 즉시 종료(실패로 보고), .claude/loop-skill.local.md 삭제됨, "pipeline reported failure" 메시지
+
+/loop-skill "간단한 작업 2" --max-iterations 10
+STATE_DIR2=$(grep '^state_dir:' .claude/loop-skill.local.md | sed 's/state_dir: *"\(.*\)"/\1/')
+echo '{"status": "complete"}' > "$STATE_DIR2/status.json"
+# 세션 종료 시도 트리거
+# Expected: loop 즉시 종료(성공으로 보고), .claude/loop-skill.local.md 삭제됨, "pipeline reported completion" 메시지
 ```
 
 **Test 6: State Dir 비침습성 (§3.5/§6.2 계약 검증)**
@@ -1078,16 +1108,16 @@ AFTER=$(find "$STATE_DIR" -type f | sort)
 
 **Test 7: 옵션 없는 기본 사용 (하위 호환성)**
 ```bash
-/loop-skill "그냥 코드 리팩토링 작업" --completion-promise "REFACTOR DONE" --max-iterations 5
+/loop-skill "그냥 코드 리팩토링 작업" --max-iterations 5
 grep '^pipeline:' .claude/loop-skill.local.md
-# Expected: "pipeline: null", 프롬프트 본문에 "그냥 코드 리팩토링 작업"이 그대로 들어있음 —
-#           원본 ralph-loop과 동일하게 동작
+# Expected: "pipeline: null", 프롬프트 본문에 "그냥 코드 리팩토링 작업"이 그대로 들어있음,
+#           completion_promise 필드는 state 파일에 존재하지 않음
 ```
 
 **Test 8: `--pipeline` 로딩**
 ```bash
 # Pre-condition: pipelines/smoke-test/prompt.md 존재 (Phase 5 최소 예시)
-/loop-skill --pipeline smoke-test --completion-promise "SMOKE OK" --max-iterations 5
+/loop-skill --pipeline smoke-test --max-iterations 5
 grep '^pipeline:' .claude/loop-skill.local.md    # "pipeline: \"smoke-test\""
 # 주의: state 파일은 frontmatter(두 번째 ---)와 본문 사이에 항상 빈 줄 하나가 들어가는 구조다
 # (원본 ralph-loop과 동일한 컨벤션). 그래서 추출한 본문의 "선행 빈 줄 1개"를 제거하고 비교해야 한다.
@@ -1097,23 +1127,44 @@ diff <(awk '/^---$/{i++;next} i>=2' .claude/loop-skill.local.md | tail -n +2) pi
 #  이는 --pipeline 로딩 로직의 버그가 아니라 state 파일 포맷 자체의 특성이므로, 테스트 판정 시 혼동하지 말 것)
 ```
 
+**Test 8.1: Config 파일 우선순위 (신규 — §3.7 검증)**
+```bash
+mkdir -p .claude
+cat > .claude/loop-skill.config <<'CFG'
+LOOP_SKILL_PIPELINE=smoke-test
+LOOP_SKILL_MAX_ITERATIONS=30
+CFG
+/loop-skill
+grep '^pipeline:' .claude/loop-skill.local.md        # "pipeline: \"smoke-test\"" (config에서)
+grep '^max_iterations:' .claude/loop-skill.local.md  # "max_iterations: 30" (config에서)
+rm .claude/loop-skill.local.md
+/loop-skill --max-iterations 7
+grep '^max_iterations:' .claude/loop-skill.local.md  # "max_iterations: 7" (CLI가 config를 override)
+grep '^pipeline:' .claude/loop-skill.local.md        # "pipeline: \"smoke-test\"" (CLI 생략분은 여전히 config에서)
+rm .claude/loop-skill.local.md .claude/loop-skill.config
+/loop-skill "config 파일 없음"
+grep '^max_iterations:' .claude/loop-skill.local.md  # "max_iterations: 50" (내장 기본값)
+# Expected: 위 세 시나리오 모두 §3.7의 CLI > config 파일 > 내장 기본값 우선순위대로 동작
+```
+
 **Test 9: Tier 1 OpenCode 재현** `[oh-my-openagent 설치 환경 전제]`
 ```bash
 # Pre-condition: OpenCode + oh-my-openagent(Claude Code 호환) 설치, loop-skill install.sh 실행 완료
 # OpenCode 세션에서 동일하게 /loop-skill 호출
-opencode run "/loop-skill '오픈코드 테스트' --completion-promise 'OC DONE' --max-iterations 3"
+opencode run "/loop-skill '오픈코드 테스트' --max-iterations 3"
+# LLM이 <state_dir>/status.json에 {"status":"complete"}를 씀
 # Expected: Claude Code에서와 동일하게 Stop hook이 발동해 세션 종료가 막히고,
-#           completion-promise 매칭 시 정상 종료됨 — 별도 OpenCode 전용 코드 없이 동작
+#           status.json 완료 신호 시 정상 종료됨 — 별도 OpenCode 전용 코드 없이 동작
 ```
 
 **Test 10: Full Cycle**
 ```bash
 ./install/install.sh
-/loop-skill "e2e 테스트" --completion-promise "E2E DONE" --max-iterations 2
-# iteration 2에서 LLM이 <promise>E2E DONE</promise> 출력
+/loop-skill "e2e 테스트" --max-iterations 2
+# iteration 2에서 LLM이 <state_dir>/status.json에 {"status":"complete"} 작성
 ./install/uninstall.sh
 find ~/.claude/skills/loop-skill ~/.claude/commands/loop-skill.md ~/.claude/commands/cancel-loop-skill.md 2>&1
-# Expected: install 성공 → loop 2 iteration 후 completion-promise로 정상 종료 →
+# Expected: install 성공 → loop 2 iteration 후 status.json 완료 신호로 정상 종료 →
 #           uninstall 후 위 find 결과가 전부 "No such file or directory"
 ```
 
@@ -1140,7 +1191,7 @@ test ! -f .claude/loop-skill.local.md
 - **Language**: Bash(scripts/hooks), PowerShell(installers), Markdown(commands/pipeline prompt)
 - **Data Format**: YAML(state frontmatter), JSON(hook 출력, install-state.json)
 - **File Operations**: cp, rm, jq(JSON 병합/파싱), sha256sum/tar(해시 계산)
-- **외부 의존성**: `jq`(필수, install/uninstall/stop-hook 전부에서 사용), `perl`(stop-hook의 `<promise>` 추출, 원본 ralph-loop과 동일)
+- **외부 의존성**: `jq`(필수, install/uninstall/stop-hook 전부에서 사용 — stop-hook은 `status.json` 파싱에도 `jq`를 쓴다)
 
 ## 14. 참고 문서
 
