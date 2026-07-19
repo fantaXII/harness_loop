@@ -1,23 +1,96 @@
 # loop-skill
 
-Generic self-referential loop (ralph-loop pattern) for Claude Code, with a pipeline
-extension point. The core knows nothing about any particular domain — it only manages
-iteration count, a `<state_dir>/status.json` completion check, and a `state_dir` handoff.
-See `docs/implementation-spec_v02.md` and `docs/harness_loop_plan_v02.md` in the parent
-repository for the full design rationale.
+Claude Code용 범용 self-referential 루프(ralph-loop 패턴)이며, pipeline 확장 지점을 제공합니다.
+코어는 특정 도메인에 대해 전혀 알지 못합니다 — 오직 반복 횟수, `<state_dir>/status.json` 완료
+체크, `state_dir` handoff만 관리합니다. 전체 설계 근거는 이 저장소의
+`docs/implementation-spec_v03.md`와 `docs/harness_loop_plan_v03.md`를 참고하세요.
 
-## Install
+## 구조
+
+```
+harness_loop/                      # 이 저장소 (loop-skill 코어 + 설계 문서)
+├── README.md                      # 이 파일
+├── docs/                          # 설계 근거 (harness_loop_plan_v0N.md, implementation-spec_v0N.md)
+└── loop-skill/                    # 실제 설치되는 skill/plugin 페이로드
+    ├── .claude-plugin/
+    │   └── plugin.json            # 플러그인 메타데이터 (이름/버전/설명)
+    ├── commands/
+    │   ├── loop-skill.md          # /loop-skill 커맨드 정의
+    │   └── cancel-loop-skill.md   # /cancel-loop-skill 커맨드 정의
+    ├── hooks/
+    │   ├── hooks.json             # Stop 훅 등록 정의 (네이티브 plugin 경로용)
+    │   └── stop-hook.sh           # 매 iteration마다 세션 종료를 가로채는 엔진
+    ├── install/
+    │   ├── install.sh / install.ps1       # 수동 설치 (복사 + settings.json에 Stop 훅 등록)
+    │   └── uninstall.sh / uninstall.ps1   # 수동 제거 (설치 시 만든 것만 정확히 제거)
+    ├── scripts/
+    │   ├── setup-loop-skill.sh / .ps1     # 루프 state 파일을 초기화하는 엔진
+    │   ├── apply-skill.sh / .ps1          # 기존 skill을 `<name>-loop`로 wrap
+    │   └── unapply-skill.sh / .ps1        # wrap 원복
+    └── pipelines/
+        ├── README.md               # pipeline 작성 가이드
+        └── smoke-test/
+            └── prompt.md           # 최소 예시 pipeline
+```
+
+## 기본 동작 흐름
+
+```
+사용자                                      Claude Code 세션
+  │
+  │ /loop-skill "todo API 만들어줘" --max-iterations 20
+  ▼
+setup-loop-skill.sh
+  │  · .claude/loop-skill.local.md 생성
+  │      (frontmatter: iteration=1, max_iterations=20,
+  │       state_dir, session_id, pipeline)
+  │  · state_dir 디렉토리 생성 (빈 디렉토리 하나)
+  ▼
+LLM이 프롬프트를 받아 작업 수행 ────────────────┐
+  │                                            │  (state_dir 안 파일 + git history로
+  │ 세션 종료 시도                                │   iteration 간 컨텍스트가 이어짐)
+  ▼                                            │
+Stop 훅(stop-hook.sh)이 가로챔                    │
+  │                                            │
+  ├─ <state_dir>/status.json 존재?               │
+  │    ├─ status == "complete" → state 파일 삭제 → 세션 정상 종료 ✅
+  │    └─ status == "failed"   → state 파일 삭제 → 세션 정상 종료 🛑 (사유 포함)
+  │                                            │
+  ├─ iteration ≥ max_iterations? → state 파일 삭제 → 세션 정상 종료 🛑
+  │                                            │
+  └─ 아니면 iteration += 1, 동일 프롬프트를 그대로 재feed(block) ─┘
+```
+
+`/cancel-loop-skill`은 `.claude/loop-skill.local.md`를 직접 삭제해 위 루프를 즉시 끊습니다.
+
+## apply-skill 흐름 (기존 skill을 loop으로 wrap)
+
+```
+~/.claude/skills/l1-log-analysis/            apply-skill.sh l1-log-analysis
+        │                                              │
+        ▼                                              ▼
+  원본을 백업 ──────────► ~/.claude/loop-applied/backups/l1-log-analysis/
+        │
+        └─► 같은 자리에 l1-log-analysis-loop/ 생성
+              ├─ SKILL.md 본문(frontmatter 제외) → pipeline.md로 추출
+              ├─ setup-loop-skill.sh(엔진)을 그대로 복사 (자기완결적, 어디로 옮겨도 동작)
+              └─ /l1-log-analysis-loop 커맨드가 --prompt-file로 위 pipeline.md를 로드
+
+Stop 훅은 머신에 정확히 1개(코어 설치 시 등록)만 존재하며, 모든 -loop skill이 이를 공유합니다.
+```
+
+## 설치
 
 ```bash
 ./install/install.sh      # Linux/Mac/WSL
 .\install\install.ps1     # Windows PowerShell
 ```
 
-Copies this skill payload to `~/.claude/skills/loop-skill`, registers
-`/loop-skill` and `/cancel-loop-skill` as commands, and adds a `Stop` hook entry to
-`~/.claude/settings.json` (with a timestamped backup).
+이 skill 페이로드를 `~/.claude/skills/loop-skill`에 복사하고, `/loop-skill`과
+`/cancel-loop-skill`을 명령어로 등록하며, `~/.claude/settings.json`에 `Stop` 훅 항목을
+추가합니다(타임스탬프가 찍힌 백업과 함께).
 
-## Use
+## 사용법
 
 ```bash
 /loop-skill Build a REST API for todos --max-iterations 20
@@ -25,12 +98,12 @@ Copies this skill payload to `~/.claude/skills/loop-skill`, registers
 /cancel-loop-skill
 ```
 
-The loop stops when the LLM writes `{"status": "complete"}` (or `{"status": "failed",
-"reason": "..."}`) to `<state_dir>/status.json`, or when `--max-iterations` is reached.
+루프는 LLM이 `<state_dir>/status.json`에 `{"status": "complete"}`(또는 `{"status": "failed",
+"reason": "..."}`)를 쓰거나, `--max-iterations`에 도달하면 멈춥니다.
 
-Project-level defaults for `--pipeline`/`--max-iterations` can be set in
-`.claude/loop-skill.config` (dotenv format) so you don't have to repeat them every call —
-CLI flags always override the config file:
+`--pipeline`/`--max-iterations`의 프로젝트 단위 기본값은 `.claude/loop-skill.config`
+(dotenv 형식)에 설정할 수 있어 매번 반복 입력할 필요가 없습니다 — CLI 플래그가 항상 config
+파일보다 우선합니다:
 
 ```bash
 # .claude/loop-skill.config
@@ -38,9 +111,9 @@ LOOP_SKILL_PIPELINE=smoke-test
 LOOP_SKILL_MAX_ITERATIONS=20
 ```
 
-See `pipelines/README.md` for how to plug in a pipeline.
+pipeline을 연결하는 방법은 `pipelines/README.md`를 참고하세요.
 
-## Wrap an existing skill into a loop (`apply-skill`)
+## 기존 skill을 loop으로 감싸기 (`apply-skill`)
 
 `/loop-skill`(위)은 항상 그 이름 자체로 시작하는 범용 진입점입니다. 반대로, **이미 갖고 있는 skill을
 그 skill 이름으로 그대로 loop처럼 돌리고 싶다면** `apply-skill`을 씁니다. 예를 들어
@@ -115,20 +188,20 @@ unapply-skill.sh l1-log-analysis
   wrap할 계획이라면, 그 구분자를 `---` 대신 다른 표기(예: `===` 또는 헤딩)로 바꾸는 것을 권장합니다.
 - 활성 loop 하나 제한, cancel 공유 등은 `/loop-skill`과 동일하게 적용됩니다(위 "동시성" 참고).
 
-design rationale과 나머지 세부사항은 `docs/harness_loop_plan_v03.md`, `docs/implementation-spec_v03.md`
+설계 근거와 나머지 세부사항은 `docs/harness_loop_plan_v03.md`, `docs/implementation-spec_v03.md`
 (상위 저장소)를 참고하세요.
 
-## Uninstall
+## 제거
 
 ```bash
 ./install/uninstall.sh    # Linux/Mac/WSL
 .\install\uninstall.ps1   # Windows PowerShell
 ```
 
-Removes only what the matching installer created — any other hooks or commands you
-added later are left untouched.
+해당 installer가 만든 것만 제거합니다 — 이후에 직접 추가한 다른 훅이나 명령어는
+그대로 남습니다.
 
 **주의:** 이건 loop-skill 코어 자체(Stop 훅, `/loop-skill`, `/cancel-loop-skill`)를 제거하는
-것입니다. 개별적으로 wrap한 skill을 되돌리고 싶다면 이건 실행하지 말고, 위 "Wrap an existing skill"
-절의 `unapply-skill.sh <name>`을 쓰세요 — 그러면 코어는 그대로 두고 그 skill 하나만 원래대로
-복원됩니다.
+것입니다. 개별적으로 wrap한 skill을 되돌리고 싶다면 이건 실행하지 말고, 위 "기존 skill을 loop으로
+감싸기" 절의 `unapply-skill.sh <name>`을 쓰세요 — 그러면 코어는 그대로 두고 그 skill 하나만
+원래대로 복원됩니다.
