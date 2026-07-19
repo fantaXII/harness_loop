@@ -15,6 +15,7 @@ DEFAULT_MAX_ITERATIONS=50
 PROMPT_PARTS=()
 MAX_ITERATIONS=""
 PIPELINE_NAME=""
+PROMPT_FILE=""
 STATE_DIR_OVERRIDE=""
 CLI_MAX_ITERATIONS_SET=false
 CLI_PIPELINE_SET=false
@@ -33,6 +34,8 @@ OPTIONS:
   --max-iterations <n>   Maximum iterations before auto-stop (default: 50, 0 = unlimited)
   --pipeline <name>       Load pipelines/<name>/prompt.md as the loop body
                           (value = folder name under pipelines/, e.g. "l1-log-analysis")
+  --prompt-file <path>     Load an arbitrary absolute-path file as the loop body
+                          (used by apply-skill.sh launchers; see harness_loop_plan_v03.md §10)
   --state-dir <path>       Override the default state_dir location
   -h, --help              Show this help message
 
@@ -60,6 +63,12 @@ HELP_EOF
         exit 1
       fi
       PIPELINE_NAME="$2"; CLI_PIPELINE_SET=true; shift 2 ;;
+    --prompt-file)
+      if [[ -z "${2:-}" ]] || [[ ! -f "$2" ]]; then
+        echo "❌ Error: --prompt-file requires an existing file path, got: ${2:-<missing>}" >&2
+        exit 1
+      fi
+      PROMPT_FILE="$2"; shift 2 ;;
     --state-dir)
       if [[ -z "${2:-}" ]]; then
         echo "❌ Error: --state-dir requires a path argument" >&2
@@ -100,9 +109,14 @@ if [[ -f "$STATE_FILE" ]]; then
   exit 1
 fi
 
-# Resolve the prompt body: --pipeline takes precedence over inline PROMPT.
-# The core does NOT interpret pipeline prompt.md content — it is read and
-# copied verbatim. PIPELINE_NAME must match a folder name under pipelines/.
+# Resolve the prompt body: --pipeline takes precedence over --prompt-file, which
+# takes precedence over inline PROMPT. The core does NOT interpret pipeline
+# prompt.md content — it is read and copied verbatim. PIPELINE_NAME must match a
+# folder name under pipelines/.
+# §10 (v03): --prompt-file sits between --pipeline and inline PROMPT in
+# precedence. Unlike --pipeline, it takes an absolute path and never touches
+# ${CLAUDE_PLUGIN_ROOT} — this is what makes bundled per-skill engines
+# relocatable (harness_loop_plan_v03.md §7.2).
 if [[ -n "$PIPELINE_NAME" ]]; then
   PIPELINE_PROMPT_FILE="${CLAUDE_PLUGIN_ROOT:-.}/pipelines/${PIPELINE_NAME}/prompt.md"
   if [[ ! -f "$PIPELINE_PROMPT_FILE" ]]; then
@@ -110,6 +124,8 @@ if [[ -n "$PIPELINE_NAME" ]]; then
     exit 1
   fi
   PROMPT=$(cat "$PIPELINE_PROMPT_FILE")
+elif [[ -n "$PROMPT_FILE" ]]; then
+  PROMPT=$(cat "$PROMPT_FILE")
 else
   PROMPT="${PROMPT_PARTS[*]:-}"
   if [[ -z "$PROMPT" ]]; then
@@ -117,6 +133,7 @@ else
     echo "   Examples:" >&2
     echo "     /loop-skill Build a REST API for todos" >&2
     echo "     /loop-skill --pipeline l1-log-analysis" >&2
+    echo "     /loop-skill --prompt-file /abs/path/pipeline.md" >&2
     exit 1
   fi
 fi
@@ -131,6 +148,8 @@ mkdir -p .claude
 
 if [[ -n "$PIPELINE_NAME" ]]; then
   PIPELINE_YAML="\"$PIPELINE_NAME\""
+elif [[ -n "$PROMPT_FILE" ]]; then
+  PIPELINE_YAML="\"prompt-file:$(basename "$(dirname "$PROMPT_FILE")")\""
 else
   PIPELINE_YAML="null"
 fi
@@ -154,7 +173,7 @@ cat <<EOF
 
 Iteration: 1
 Max iterations: $(if [[ $MAX_ITERATIONS -gt 0 ]]; then echo $MAX_ITERATIONS; else echo "unlimited"; fi)
-Pipeline: $(if [[ -n "$PIPELINE_NAME" ]]; then echo "$PIPELINE_NAME"; else echo "none (plain prompt)"; fi)
+Pipeline: $(if [[ -n "$PIPELINE_NAME" ]]; then echo "$PIPELINE_NAME"; elif [[ -n "$PROMPT_FILE" ]]; then echo "prompt-file:$PROMPT_FILE"; else echo "none (plain prompt)"; fi)
 State dir: $STATE_DIR
 
 The Stop hook is now active. To cancel: /cancel-loop-skill
